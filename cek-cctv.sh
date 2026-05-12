@@ -31,15 +31,27 @@ if [ -f "$WORK_DIR/.provisioned" ]; then
     exit 0
 fi
 
-# 2. INSTALASI DEPENDENSI (Otomatis)
-echo "[*] Mengecek dan menginstal senjata mesin..."
-DEPS="ffmpeg wireguard curl jq nmap"
-for DEP in $DEPS; do
-    if ! command -v $DEP &> /dev/null; then
-        echo "[*] Menginstal $DEP..."
-        apt-get update -y > /dev/null && apt-get install $DEP -y > /dev/null
-    fi
-done
+# 2. INSTALASI DEPENDENSI (Cerdas & Sekali Jalan)
+echo "[*] Mengecek kelengkapan senjata mesin..."
+
+MISSING_PKGS=""
+
+# Pengecekan biner vs package yang akurat
+if ! command -v ffmpeg &> /dev/null; then MISSING_PKGS+=" ffmpeg"; fi
+if ! command -v wg &> /dev/null; then MISSING_PKGS+=" wireguard"; fi
+if ! command -v curl &> /dev/null; then MISSING_PKGS+=" curl"; fi
+if ! command -v jq &> /dev/null; then MISSING_PKGS+=" jq"; fi
+if ! command -v nmap &> /dev/null; then MISSING_PKGS+=" nmap"; fi
+
+if [ -n "$MISSING_PKGS" ]; then
+    echo "[-] Ditemukan dependensi yang kurang:$MISSING_PKGS"
+    echo "[*] Memperbarui repositori dan menginstal (Harap tunggu)..."
+    apt-get update -y > /dev/null
+    apt-get install -y $MISSING_PKGS > /dev/null
+    echo "[+] Instalasi senjata tambahan selesai."
+else
+    echo "[+] Seluruh sistem dasar (FFmpeg, WireGuard, dll) sudah terinstal. Melewati fase ini."
+fi
 
 # 3. IDENTITAS HARDWARE (MAC ADDRESS)
 mkdir -p $WORK_DIR
