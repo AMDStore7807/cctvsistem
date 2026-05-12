@@ -61,16 +61,63 @@ if [ -z "$STB_SERIAL" ]; then
 fi
 echo "[+] Serial/ID STB Terdeteksi: $STB_SERIAL"
 
-# 4. AUTO-DISCOVERY NVR (Pemindaian Subnet Lokal)
-echo "[*] Memindai jaringan lokal (Port 37777/554) untuk mencari NVR Dahua..."
-SUBNET=$(ip -o -f inet addr show | awk '/scope global/ {print $4}' | head -n 1)
-NVR_IP=$(nmap -p 37777,554 --open $SUBNET | grep "Nmap scan report" | awk '{print $NF}' | tr -d '()' | head -n 1)
+# ==============================================================================
+# FASE 4: INTEROGASI LINGKUNGAN (HYBRID DISCOVERY)
+# ==============================================================================
 
-if [ -z "$NVR_IP" ]; then
-    echo "[-] FATAL: NVR tidak ditemukan di jaringan $SUBNET."
-    exit 1
+echo "------------------------------------------------------"
+echo "[?] Apakah Anda sudah mengetahui IP NVR Dahua di lokasi ini?"
+echo "    (Ketik 'y' untuk input manual, 'n' untuk Auto-Scan)"
+echo "------------------------------------------------------"
+read -p "Pilihan Anda (y/n): " KNOW_IP
+
+if [[ "$KNOW_IP" == "y" || "$KNOW_IP" == "Y" ]]; then
+    # JALUR MANUAL
+    read -p "[>] Masukkan IP NVR Dahua: " NVR_IP
+else
+    # JALUR OTOMATIS (Sapuan Layer 2 & Layer 4)
+    echo "[*] Memulai sapuan Radar Layer 2 untuk NVR Dahua..."
+    IFACE=$(ip route | grep default | awk '{print $5}' | head -n 1)
+    if [ -z "$IFACE" ]; then
+        IFACE=$(ip -4 addr show scope global | grep -v "wg0" | awk '{print $NF}' | head -n 1)
+    fi
+    LOCAL_RANGE=$(ip -o -f inet addr show $IFACE | awk '{print $4}')
+    
+    # Sapuan 1: Cek MAC Address Dahua (Tercepat & Paling Akurat)
+    NVR_IP=$(nmap -sn $LOCAL_RANGE | grep -B 2 -i "dahua" | grep "Nmap scan report" | awk '{print $NF}' | tr -d '()' | head -n 1)
+    
+    if [ -z "$NVR_IP" ]; then
+        echo "[-] Radar MAC Gagal. Memulai Sapuan Port 37777 (Fallback)..."
+        # Sapuan 2: Cek Port Spesifik Dahua
+        NVR_IP=$(nmap -n -T4 -p 37777 --open $LOCAL_RANGE | grep "Nmap scan report" | awk '{print $NF}' | tr -d '()' | head -n 1)
+    fi
+
+    # Jika mesin tetap gagal menemukan
+    if [ -z "$NVR_IP" ]; then
+        echo "[-] FATAL: Mesin gagal menemukan NVR di jaringan $LOCAL_RANGE."
+        echo "[!] Periksa kabel LAN."
+        read -p "[>] Masukkan IP NVR secara manual paksa: " NVR_IP
+    else
+        echo "[+] AUTO-DISCOVERY SUKSES: NVR terkunci di IP $NVR_IP"
+    fi
 fi
-echo "[+] NVR Ditemukan di IP: $NVR_IP"
+
+# ==============================================================================
+# FASE 5: KREDENSIAL KEAMANAN
+# ==============================================================================
+
+echo "------------------------------------------------------"
+echo "[?] Masukkan Password NVR Dahua"
+echo "    (Kosongkan dan tekan Enter jika passwordnya adalah 'Admin123')"
+echo "------------------------------------------------------"
+read -p "[>] Password: " INPUT_PASS
+
+# Jika input kosong, gunakan Admin123 sebagai default
+SOP_NVR_PASS=${INPUT_PASS:-Admin123}
+# Username baku Dahua hampir selalu 'admin'
+SOP_NVR_USER="admin"
+
+echo "[+] Konfigurasi Target: IP=$NVR_IP, User=$SOP_NVR_USER, Pass=******"
 
 # 5. PENCIPTAAN KUNCI ENKRIPSI
 echo "[*] Menempa kunci VPN WireGuard..."
