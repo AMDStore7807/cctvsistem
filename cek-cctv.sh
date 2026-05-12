@@ -1,44 +1,67 @@
 #!/bin/bash
-# =========================================================
-# EDGE-GUARDIAN V5 - ZERO TOUCH PROVISIONING (ZTP)
-# =========================================================
+# ==============================================================================
+# EDGE-GUARDIAN V6 - MASTER PROVISIONING SCRIPT (STB TO CLOUD)
+# Tugas: Auto-Install, Auto-Discover NVR, API Handshake, Systemd Daemon Creation
+# ==============================================================================
 
-# 1. PENCEGAHAN EKSEKUSI GANDA
-if [ -f "/home/cctv-sistem/.provisioned" ]; then
-    echo "[-] STB ini sudah ter-provisioning. Keluar."
-    exit 0
-fi
+# ------------------------------------------------------------------------------
+# [!] KONFIGURASI WAJIB (EDIT DI VSCODE SEBELUM EKSEKUSI)
+# ------------------------------------------------------------------------------
+# Kredensial baku NVR di seluruh desa (SOP Perusahaan)
+SOP_NVR_USER="admin"
+SOP_NVR_PASS="Admin123"
 
-# 2. EKSTRAKSI IDENTITAS HARDWARE (SERIAL)
-# Menggunakan MAC Address eth0 tanpa titik dua (contoh: 0242ac110002)
-STB_SERIAL=$(cat /sys/class/net/eth0/address | tr -d ':')
-if [ -z "$STB_SERIAL" ]; then
-    # Fallback jika eth0 tidak ada
-    STB_SERIAL=$(cat /proc/cpuinfo | grep Serial | awk '{print $3}')
+# Endpoint Control Plane (ExpressJS Anda di VPS)
+API_URL="http://103.133.223.167:4000/api/provision"
+API_TOKEN="BOS_SECRET_TOKEN_2026_SUPER_AMAN"
+# ------------------------------------------------------------------------------
+
+echo "[+] MEMULAI ZERO-TOUCH PROVISIONING (ZTP) STB..."
+
+# 1. VALIDASI ROOT & KUNCI GANDA
+if [ "$EUID" -ne 0 ]; then
+  echo "[-] FATAL: Skrip ini wajib dijalankan sebagai root (Gunakan sudo)."
+  exit 1
 fi
 
 WORK_DIR="/home/cctv-sistem"
+if [ -f "$WORK_DIR/.provisioned" ]; then
+    echo "[-] STB ini sudah dikonfigurasi sebelumnya. Eksekusi dibatalkan."
+    echo "[-] Hapus $WORK_DIR/.provisioned jika ingin mereset."
+    exit 0
+fi
+
+# 2. INSTALASI DEPENDENSI (Otomatis)
+echo "[*] Mengecek dan menginstal senjata mesin..."
+DEPS="ffmpeg wireguard curl jq nmap"
+for DEP in $DEPS; do
+    if ! command -v $DEP &> /dev/null; then
+        echo "[*] Menginstal $DEP..."
+        apt-get update -y > /dev/null && apt-get install $DEP -y > /dev/null
+    fi
+done
+
+# 3. IDENTITAS HARDWARE (MAC ADDRESS)
 mkdir -p $WORK_DIR
+STB_SERIAL=$(cat /sys/class/net/eth0/address 2>/dev/null | tr -d ':' || cat /sys/class/net/end0/address 2>/dev/null | tr -d ':')
+if [ -z "$STB_SERIAL" ]; then
+    STB_SERIAL=$(cat /proc/cpuinfo | grep Serial | awk '{print $3}')
+fi
+echo "[+] Serial/ID STB Terdeteksi: $STB_SERIAL"
 
-# 3. KREDENSIAL NVR BAKU (SOP PERUSAHAAN ANDA)
-# Ini adalah harga mati. Hardware di lapangan HARUS disetting seperti ini
-NVR_USER="admin"
-NVR_PASS="Admin123"
-
-# 4. AUTO-DISCOVERY IP NVR (Pemindaian Subnet)
-echo "[*] Memindai subnet lokal untuk mencari NVR Dahua..."
-# Ambil subnet STB saat ini (misal 192.168.1.0/24)
-SUBNET=$(ip -o -f inet addr show eth0 | awk '/scope global/ {print $4}')
-# Cari IP yang membuka port 37777 (Dahua) atau 554 (RTSP)
-NVR_IP=$(nmap -p 37777 --open $SUBNET | grep "Nmap scan report" | awk '{print $NF}' | tr -d '()' | head -n 1)
+# 4. AUTO-DISCOVERY NVR (Pemindaian Subnet Lokal)
+echo "[*] Memindai jaringan lokal (Port 37777/554) untuk mencari NVR Dahua..."
+SUBNET=$(ip -o -f inet addr show | awk '/scope global/ {print $4}' | head -n 1)
+NVR_IP=$(nmap -p 37777,554 --open $SUBNET | grep "Nmap scan report" | awk '{print $NF}' | tr -d '()' | head -n 1)
 
 if [ -z "$NVR_IP" ]; then
-    echo "[-] FATAL: NVR tidak ditemukan di jaringan. ZTP Gagal."
+    echo "[-] FATAL: NVR tidak ditemukan di jaringan $SUBNET."
     exit 1
 fi
 echo "[+] NVR Ditemukan di IP: $NVR_IP"
 
-# 5. PEMBUATAN KUNCI WIREGUARD
+# 5. PENCIPTAAN KUNCI ENKRIPSI
+echo "[*] Menempa kunci VPN WireGuard..."
 mkdir -p /etc/wireguard
 cd /etc/wireguard
 umask 077
@@ -46,12 +69,8 @@ wg genkey | tee privatekey | wg pubkey > publickey
 STB_PRIV=$(cat privatekey)
 STB_PUB=$(cat publickey)
 
-# 6. AUTO-REGISTRASI KE CONTROL PLANE EXPRESSJS
-API_URL="http://103.133.223.167:3000/api/provision"
-API_TOKEN="BOS_SECRET_TOKEN_2026_SUPER_AMAN"
-
-echo "[*] Mendaftarkan Serial $STB_SERIAL ke Control Plane..."
-
+# 6. HANDSHAKE KE CONTROL PLANE (EXPRESS JS)
+echo "[*] Menghubungi Control Plane di awan..."
 RESPONSE=$(curl -s -X POST $API_URL \
   -H "Content-Type: application/json" \
   -d "{\"token\":\"$API_TOKEN\", \"serial\":\"$STB_SERIAL\", \"stbPublicKey\":\"$STB_PUB\"}")
@@ -59,19 +78,23 @@ RESPONSE=$(curl -s -X POST $API_URL \
 IS_SUCCESS=$(echo $RESPONSE | jq -r '.success')
 
 if [ "$IS_SUCCESS" != "true" ]; then
-    echo "[-] FATAL: Registrasi API Ditolak -> $(echo $RESPONSE | jq -r '.error')"
+    echo "[-] FATAL: Registrasi API Ditolak oleh Server!"
+    echo "[-] Pesan Error API: $(echo $RESPONSE | jq -r '.error')"
     exit 1
 fi
 
 VPS_PUB=$(echo $RESPONSE | jq -r '.vpsPublicKey')
 VPS_ENDPOINT=$(echo $RESPONSE | jq -r '.vpsEndpoint')
 STB_VPN_IP=$(echo $RESPONSE | jq -r '.stbVpnIp')
-STREAM_PREFIX=$(echo $RESPONSE | jq -r '.streamPrefix')
 TARGET_IP=$(echo $RESPONSE | jq -r '.mediaMtxTarget')
+PREFIX=$(echo $RESPONSE | jq -r '.streamPrefix')
 
-echo "[+] Registrasi Berhasil. IP VPN: $STB_VPN_IP, Prefix: $STREAM_PREFIX"
+echo "[+] Registrasi Sukses! Mendapat IP VPN: $STB_VPN_IP dan Jalur: $PREFIX"
 
-# 7. MERAKIT KONFIGURASI DAN SCRIPT STREAMING
+# 7. MERAKIT ARSITEKTUR KONEKSI
+echo "[*] Merakit file konfigurasi internal..."
+
+# File Konfigurasi WireGuard
 cat << EOF > /etc/wireguard/wg0.conf
 [Interface]
 PrivateKey = $STB_PRIV
@@ -84,28 +107,29 @@ AllowedIPs = 10.8.0.0/24
 PersistentKeepalive = 25
 EOF
 
+# File Variabel Lingkungan
 cat << EOF > $WORK_DIR/koneksi.env
 IP_NVR="$NVR_IP"
-USER_NVR="$NVR_USER"
-PASS_NVR="$NVR_PASS"
+USER_NVR="$SOP_NVR_USER"
+PASS_NVR="$SOP_NVR_PASS"
 IP_TARGET="$TARGET_IP"
-PREFIX="$STREAM_PREFIX"
+PREFIX="$PREFIX"
 EOF
 
-# 8. MERAKIT AUTOPUSHER (Dengan Prefix URL Bebas Tumbukan)
+# 8. MERAKIT MESIN PENDORONG (AUTOPUSHER)
+echo "[*] Merakit mesin Autopusher..."
 cat << 'EOF_SCRIPT' > $WORK_DIR/autopusher.sh
 #!/bin/bash
 source /home/cctv-sistem/koneksi.env
 
-TOTAL_SCAN=16
+TOTAL_SCAN=4 # Ubah ke 8 atau 16 jika STB kuat
 pkill ffmpeg
 
 for (( i=1; i<=$TOTAL_SCAN; i++ ))
 do
     IS_ONLINE=$(ffprobe -v error -rtsp_transport tcp -i "rtsp://$USER_NVR:$PASS_NVR@$IP_NVR:554/cam/realmonitor?channel=$i&subtype=1" -show_entries stream=codec_name -of csv=p=0 2>&1)
     
-    if [[ $IS_ONLINE == *"h264"* ]]; then
-        # PERHATIKAN: URL target menggunakan PREFIX dari ExpressJS
+    if [[ $IS_ONLINE == *"h264"* ]] || [[ $IS_ONLINE == *"hevc"* ]]; then
         ffmpeg -hide_banner -loglevel error -rtsp_transport tcp \
           -i "rtsp://$USER_NVR:$PASS_NVR@$IP_NVR:554/cam/realmonitor?channel=$i&subtype=1" \
           -c:v copy -c:a libopus -b:a 48k \
@@ -116,12 +140,46 @@ wait
 EOF_SCRIPT
 chmod +x $WORK_DIR/autopusher.sh
 
-# 9. EKSEKUSI DAN PENGUNCIAN SYSTEM
+# 9. PENCIPTAAN LAYANAN ABADI (SYSTEMD)
+echo "[*] Menanamkan layanan ke dalam kernel OS..."
+cat << EOF > /etc/systemd/system/cctv-pusher.service
+[Unit]
+Description=Layanan Pendorong Video CCTV
+After=network.target wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$WORK_DIR
+ExecStart=$WORK_DIR/autopusher.sh
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 10. EKSEKUSI MUTLAK & PENGUNCIAN
+echo "[*] Menyalakan seluruh sistem operasi CCTV..."
+systemctl daemon-reload
+
+# Nyalakan VPN
 systemctl enable wg-quick@wg0
 systemctl start wg-quick@wg0
 
-# (Lewati pembuatan cctv-desa.service jika sudah ada di image awal, atau buat di sini seperti skrip sebelumnya)
-systemctl start cctv-desa
+# Tunggu 3 detik agar rute VPN mapan
+sleep 3
 
+# Nyalakan Pusher
+systemctl enable cctv-pusher
+systemctl start cctv-pusher
+
+# Kunci skrip agar tidak dieksekusi ulang secara tak sengaja
 touch $WORK_DIR/.provisioned
-echo "[+] ZTP Selesai. Sistem Terkunci dan Sedang Streaming!"
+
+echo "========================================================================"
+echo "[+] INSTALASI RAMPUNG, BOS!"
+echo "[+] VPN Aktif, NVR Terdeteksi ($NVR_IP), FFmpeg Sedang Berjalan."
+echo "[+] Cek log layanan jika butuh audit: journalctl -u cctv-pusher -f"
+echo "========================================================================"
